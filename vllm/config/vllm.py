@@ -599,6 +599,12 @@ class VllmConfig:
         if self._dflash_needs_multi_kv_group():
             return True
 
+        # The DFlash2 candidate selector exists only in the V2 speculator. On V1
+        # the same checkpoint drafts through DFlashProposer, which never calls
+        # it, so the draft degrades to DFlash1 silently. Force V2 as for dspark.
+        if self._is_dflash2_draft():
+            return True
+
         if self.model_config is not None and self.model_config.is_diffusion:
             return True
 
@@ -633,6 +639,17 @@ class VllmConfig:
         layer_types = getattr(draft_config.hf_config, "layer_types", None) or []
         num_sliding = sum(lt == "sliding_attention" for lt in layer_types)
         return 0 < num_sliding < len(layer_types)
+
+    def _is_dflash2_draft(self) -> bool:
+        """Whether the DFlash draft is a DFlash2 one, by the architecture the
+        speculator selects on (v1/worker/gpu/spec_decode/__init__.py)."""
+        spec = self.speculative_config
+        if spec is None or spec.method != "dflash":
+            return False
+        draft_config = getattr(spec, "draft_model_config", None)
+        if draft_config is None:
+            return False
+        return "DFlash2DraftModel" in (draft_config.architectures or [])
 
     def _is_default_v2_model_runner_model(self) -> bool:
         model_config = self.model_config

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import copy
 from collections.abc import Mapping
 from typing import Any
 
@@ -84,8 +85,11 @@ class DFlashSpeculator(DraftModelSpeculator):
         self.sample_pos = torch.zeros(
             max_num_sampled_tokens, dtype=torch.int64, device=device
         )
-        self.sample_idx_mapping = torch.zeros(
-            max_num_sampled_tokens, dtype=torch.int32, device=device
+        # -1 marks an inert sampling row. CUDA graph capture can execute the
+        # full buffer before a real batch has populated it, so zero would make
+        # every padding row scatter into request slot 0.
+        self.sample_idx_mapping = torch.full(
+            (max_num_sampled_tokens,), -1, dtype=torch.int32, device=device
         )
         # [0, 1, ..., N-1, 0, 1, ..., N-1, ...] -> the per-token column index into
         # draft_logits[req, step, :].
@@ -99,13 +103,21 @@ class DFlashSpeculator(DraftModelSpeculator):
     @property
     def attn_vllm_config(self) -> VllmConfig:
         # The draft's attention differs from the target's in causality.
-        return replace(
-            self.vllm_config,
-            attention_config=replace(
-                self.vllm_config.attention_config,
-                use_non_causal=self.requires_non_causal,
-            ),
+        config = copy.copy(super().attn_vllm_config)
+        config.attention_config = replace(
+            self.vllm_config.attention_config,
+            use_non_causal=self.requires_non_causal,
         )
+        return config
+
+    def draft_logits_spec(
+        self, vllm_config: VllmConfig
+    ) -> tuple[torch.dtype, float]:
+        """Return the dtype and fill value for the draft logits cache.
+
+        Subclasses (e.g. DFlash2) can override this to change the allocation.
+        """
+        return self.dtype, 0.0
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         wants_full = cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
@@ -135,11 +147,10 @@ class DFlashSpeculator(DraftModelSpeculator):
 
     def capture(self) -> None:
         logger.info("Capturing model for %s speculator...", self._speculator_name)
-        # Reset sampling indices to zero to prevent stale values from prior
-        # dummy runs from being baked into the captured graph.
+        # Padded sample rows must not scatter into a live request during capture.
         self.sample_indices.zero_()
         self.sample_pos.zero_()
-        self.sample_idx_mapping.zero_()
+        self.sample_idx_mapping.fill_(-1)
         assert self.query_cudagraph_manager is not None
         self.query_cudagraph_manager.capture(
             self._generate_draft,
