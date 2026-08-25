@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING
 
 import regex as re
 
+from vllm.logger import init_logger
 from vllm.parser.engine.events import EventType
 from vllm.parser.engine.parser_engine import ParserEngine
 from vllm.parser.engine.parser_engine_config import (
@@ -47,13 +48,26 @@ FUNC_END = "</function>"
 PARAM_START = "<parameter="
 PARAM_END = "</parameter>"
 
+# Match complete <parameter=NAME>VALUE</parameter> tags.
+# Uses negative lookahead to avoid stopping at literal </parameter> or
+# <parameter= sequences that appear inside the parameter value itself.
 _PARAM_RE = re.compile(
     r"<\s*parameter\s*=\s*([^>]*)>"
-    r"(.*?)"
-    r"(?:<\s*/\s*parameter\s*>|(?=<\s*parameter\s*=))",
+    r"((?:(?!<\s*/?\s*parameter).)*)"
+    r"\s*</\s*parameter\s*>",
     re.DOTALL,
 )
-_PARTIAL_PARAM_RE = re.compile(r"<\s*parameter\s*=\s*([^>]+)>(.*)$", re.DOTALL)
+
+# Match a partial (unclosed) parameter value for streaming mode.
+# Only captures after all complete <parameter=...></parameter> tags have been
+# removed by _PARAM_RE.sub().  Uses negative lookahead so the value is not
+# prematurely truncated by literal </parameter> or <parameter= sequences.
+_PARTIAL_PARAM_RE = re.compile(
+    r"<\s*parameter\s*=\s*([^>]*)>" r"((?:(?!<\s*/?\s*parameter).)*)$",
+    re.DOTALL,
+)
+
+logger = init_logger(__name__)
 
 
 def _trim_wrapping_newlines(value: str) -> str:
@@ -65,24 +79,54 @@ def _trim_wrapping_newlines(value: str) -> str:
     return value
 
 
+def _ensure_valid_json_partial(value: str) -> str | None:
+    """Skip empty/whitespace values to prevent emitting {"key": ""}.
+
+    json.dumps handles all quote escaping automatically, so no manual
+    quote fixing is needed. Adding a closing quote for odd-quote values
+    would shift the JSON closing quote position when the value extends,
+    breaking the streaming prefix chain.
+    """
+    if not value or not value.strip():
+        return None
+    return value
+
+
 def _qwen3_arg_converter(raw_args: str, partial: bool) -> str:
+    if not raw_args or not raw_args.strip():
+        return "{}"
+
     params: dict[str, object] = {}
 
     for match in _PARAM_RE.finditer(raw_args):
-        name = match.group(1)
-        value = match.group(2)
-        params[name] = _trim_wrapping_newlines(value)
+        name = match.group(1).strip()
+        value = _trim_wrapping_newlines(match.group(2))
+        if value:
+            params[name] = value
 
     if partial:
         remaining = _PARAM_RE.sub("", raw_args)
         m = _PARTIAL_PARAM_RE.search(remaining)
         if m:
-            name = m.group(1)
+            name = m.group(1).strip()
             value = m.group(2)
-            if name:
-                params[name] = _trim_wrapping_newlines(value)
+            if name and name not in params:
+                value = _trim_wrapping_newlines(value)
+                fixed = _ensure_valid_json_partial(value)
+                if fixed is not None:
+                    params[name] = fixed
 
-    return json.dumps(params, ensure_ascii=False)
+    try:
+        result = json.dumps(params, ensure_ascii=False)
+    except (TypeError, ValueError):
+        result = "{}"
+    logger.info(
+        "QWEN3_CONVERTER: partial=%s params=%s result=%s",
+        partial,
+        list(params.keys()),
+        result,
+    )
+    return result
 
 
 @functools.cache
@@ -192,10 +236,9 @@ def qwen3_config(
             ),
         },
         arg_converter=_qwen3_arg_converter,
-        stream_arg_deltas=True,
-        repeat_tool_name_in_deltas=True,
+        stream_arg_deltas=False,
         strip_trailing_reasoning_whitespace=False,
-        tool_args_json=False,
+        tool_args_json=True,
     )
 
 

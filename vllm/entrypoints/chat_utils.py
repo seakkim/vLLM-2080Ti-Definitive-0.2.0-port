@@ -1945,10 +1945,16 @@ def _postprocess_messages(messages: list[ConversationMessage]) -> None:
                 # if arguments is None or empty string, set to {}
                 if content := function.get("arguments"):
                     if not isinstance(content, (dict, list)):
-                        parsed = json.loads(content)
-                        function["arguments"] = parsed if parsed is not None else {}
+                        try:
+                            item["function"]["arguments"] = json.loads(content)
+                        except json.JSONDecodeError as e:
+                            logger.warning(
+                                "CHAT_UTILS_JSON_FAIL: args=%s error=%s",
+                                content[:200],
+                                str(e)[:100],
+                            )
                 else:
-                    function["arguments"] = {}
+                    item["function"]["arguments"] = {}
 
 
 def parse_chat_messages(

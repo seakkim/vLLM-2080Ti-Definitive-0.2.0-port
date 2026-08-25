@@ -91,7 +91,11 @@ class TokenIDScanner:
                 if not prefix_items:
                     return [TextChunk(effective_text)]
                 prefix_items.append(TextChunk(effective_text))
-            return prefix_items or self._EMPTY
+            elif prefix_items:
+                # Deferred terminals were resolved but left no text behind.
+                # Return them so the state machine can process terminal events.
+                return prefix_items
+            return self._EMPTY
 
         token_texts = [self._decode_token(tid) for tid in delta_token_ids]
 
@@ -187,6 +191,16 @@ class TokenIDScanner:
                     self._deferred_post_text += remaining
                     remaining = ""
                 self._deferred_terminals.append(terminal)
+
+        # If there is accumulated post-text that was never consumed by any
+        # terminal resolution (either because no deferred terminals existed,
+        # or because none of them were found in delta_text), emit it as a
+        # TextChunk so the lexer can process it.  Without this, text sitting
+        # in _deferred_post_text between scan() calls gets silently dropped
+        # when has_special is False on the next call (scan returns EMPTY).
+        if self._deferred_post_text and not results:
+            results.append(TextChunk(self._deferred_post_text))
+            self._deferred_post_text = ""
 
         return results, remaining
 

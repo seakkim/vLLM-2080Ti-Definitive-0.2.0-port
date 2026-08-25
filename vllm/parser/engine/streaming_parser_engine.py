@@ -318,6 +318,20 @@ class StreamingParserEngine:
                 return []
             return self._emit_for_state(value)
 
+        # Guard against FUNC_END being matched inside an unclosed parameter
+        # tag. If the accumulated args contain more "<parameter=" openings
+        # than "</parameter>" closings, we are mid-value and the terminal
+        # text is actually part of the parameter content.
+        if (
+            self.state == ParserState.TOOL_ARGS
+            and terminal == "FUNC_END"
+            and self._args_buffer
+        ):
+            open_count = self._args_buffer.count("<parameter=")
+            close_count = self._args_buffer.count("</parameter>")
+            if open_count > close_count:
+                return self._emit_for_state(value)
+
         if self.skip_tool_parsing and terminal in self._tool_terminals:
             if self.state == ParserState.MESSAGE_HEADER:
                 self.state = ParserState.CONTENT
