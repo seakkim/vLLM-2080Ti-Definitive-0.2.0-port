@@ -4,6 +4,7 @@
 
 import importlib.util
 import os
+import sys
 from pathlib import Path
 from types import ModuleType
 from typing import Literal
@@ -89,13 +90,194 @@ logger = init_logger(__name__)
 _flashqla_legacy_module: ModuleType | None = None
 
 
+# State for the SM70/SM75 FlashQLA legacy extension probe.
+# A single SM75 runtime environment typically has one such tree, so we
+# probe candidate roots in order and cache the first that loads the
+# pre-built extension. Probing is cheap: torch.utils.cpp_extension.load()
+# in sm_legacy.py only dlopens the cached .so if it is present under
+# ``TORCH_EXTENSIONS_DIR``, which is the normal case. The probe loader
+# registers the module in ``sys.modules`` under its canonical name so the
+# real kernel entry point reuses the same module object (and its cached
+# ``_EXT``) instead of importing sm_legacy.py a second time.
+_flashqla_resolved_root: Path | None = None
+_flashqla_failed_roots: set[Path] = set()
+_probe_errors: dict[Path, BaseException] = {}
+
+
+def _flashqla_legacy_default_candidates() -> list[Path]:
+    """Fallback search locations for the SM75 FlashQLA checkout.
+
+    Mirrors the run.sh / launcher.sh candidate list so the SM75 prefill
+    backend resolves to the auto-built extension even when no launcher
+    env-prep has exported FLASHQLA_ROOT.
+    """
+    candidates: list[Path] = []
+    seen: set[Path] = set()
+
+    def add(p: Path) -> None:
+        try:
+            rp = p.resolve()
+        except OSError:
+            return
+        if rp in seen:
+            return
+        seen.add(rp)
+        candidates.append(rp)
+
+    here = Path(__file__).resolve()
+    # Ascend up to 10 parents; the venv layout depth is ~4, so we scan
+    # well past it to cover deployments where vLLM lives many levels deep
+    # (e.g. /home/inari/localmodel/<tree>/vllm/...).
+    for i in range(1, 11):
+        parent = here.parents[i - 1]
+        add(parent / ".deps" / "FlashQLA-SM70-SM75")
+        add(parent / "FlashQLA-SM70-SM75")
+
+    home = Path(os.path.expanduser("~"))
+    add(home / ".deps" / "FlashQLA-SM70-SM75")
+    add(Path("/opt/FlashQLA-SM70-SM75"))
+
+    return candidates
+
+
+def _try_load_flashqla_from_root(root: Path) -> bool:
+    """Probe ``root``: return True if the legacy SM75 extension loads from
+    it, False otherwise.
+
+    Side effects: at most one dlopen of the cache-hit ``.so``. The loaded
+    module is registered in ``sys.modules`` under its canonical name so
+    that later loaders (``_flashqla_legacy_forward``) reuse the same
+    module and its cached ``_EXT`` without re-executing ``sm_legacy.py``.
+    On failure, the reason is stored in ``_probe_errors`` and the candidate
+    is recorded in ``_flashqla_failed_roots`` so later calls do not repeat
+    the probe.
+    """
+    global _flashqla_resolved_root
+    if root in _flashqla_failed_roots:
+        return False
+    if _flashqla_resolved_root is not None and Path(_flashqla_resolved_root) == root:
+        # Already proven loadable in this process; skip the dlopen.
+        return True
+
+    if not root.is_dir():
+        _flashqla_failed_roots.add(root)
+        return False
+    source = root / "flash_qla" / "ops" / "gated_delta_rule" / "legacy" / "sm_legacy.py"
+    if not source.is_file():
+        _flashqla_failed_roots.add(root)
+        return False
+    module_name = "vllm_flashqla_sm75_legacy"
+    existing = sys.modules.get(module_name)
+    try:
+        if existing is None:
+            spec = importlib.util.spec_from_file_location(module_name, source)
+            if spec is None or spec.loader is None:
+                _flashqla_failed_roots.add(root)
+                return False
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[module_name] = module
+            spec.loader.exec_module(module)
+        else:
+            module = existing
+        load_ext = getattr(module, "_load_ext", None)
+        if load_ext is None:
+            _flashqla_failed_roots.add(root)
+            return False
+        ext = load_ext()
+        so_path = Path(getattr(ext, "__file__", ""))
+        if not so_path.is_file():
+            _flashqla_failed_roots.add(root)
+            return False
+    except Exception as exc:  # noqa: BLE001 - probe must never raise
+        # If the operator explicitly exported FLASHQLA_ROOT, an explicit
+        # failure should remain visible without raising; log at warning.
+        # Otherwise it is a fallback candidate: debug level is enough.
+        env_value = Path(os.environ.get("FLASHQLA_ROOT", "").strip()).resolve() \
+            if os.environ.get("FLASHQLA_ROOT", "").strip() else None
+        if env_value is not None and env_value == root:
+            logger.warning(
+                "FLASHQLA SM75 probe failed on explicit FLASHQLA_ROOT=%s: %s: %s",
+                root, type(exc).__name__, exc,
+            )
+        else:
+            logger.debug(
+                "FLASHQLA SM75 probe failed on candidate %s: %s: %s",
+                root, type(exc).__name__, exc,
+            )
+        _probe_errors[root] = exc
+        # Unregister a half-imported module so a fresh probe can retry.
+        sys.modules.pop(module_name, None)
+        _flashqla_failed_roots.add(root)
+        return False
+
+    _flashqla_resolved_root = root.resolve()
+    logger.info(
+        "FLASHQLA SM75 legacy extension loaded from root %s (so=%s)",
+        _flashqla_resolved_root,
+        so_path,
+    )
+    return True
+
+
+def _resolve_gdn_flashqla_root() -> Path | None:
+    """Return a FlashQLA SM75 checkout root whose pre-built extension loads
+    successfully in this process, or ``None`` if no candidate works.
+
+    Order: FLASHQLA_ROOT env var first (operator override), then the
+    auto-detected candidate list. The first successful load is cached in
+    ``_flashqla_resolved_root`` so the real kernel entry point does not
+    repeat the probe.
+    """
+    env_root = os.environ.get("FLASHQLA_ROOT", "").strip()
+    if env_root:
+        p = Path(env_root)
+        if _try_load_flashqla_from_root(p):
+            return Path(_flashqla_resolved_root)
+
+    for cand in _flashqla_legacy_default_candidates():
+        if _try_load_flashqla_from_root(cand):
+            return Path(_flashqla_resolved_root)
+    return None
+
+
 def _flashqla_legacy_forward():
-    """Load the SM75 extension without importing FlashQLA's TileLang package."""
+    """Load the SM75 extension without importing FlashQLA's TileLang package.
+
+    The module is looked up by its canonical name in ``sys.modules`` first;
+    the SM75 probe installer registers it there on success, so this path is
+    a stable no-op after the first successful probe in this process.
+    """
     global _flashqla_legacy_module
     if _flashqla_legacy_module is None:
-        root = os.environ.get("FLASHQLA_ROOT")
+        module_name = "vllm_flashqla_sm75_legacy"
+        sys_module = sys.modules.get(module_name)
+        if sys_module is not None and hasattr(
+            sys_module, "chunk_gated_delta_rule_fwd_legacy"
+        ):
+            # Already loaded by the probe installer in this process. Reuse so
+            # the cached _EXT (and any CUDA state it holds) is preserved.
+            _flashqla_legacy_module = sys_module
+            return _flashqla_legacy_module.chunk_gated_delta_rule_fwd_legacy
+
+        root = os.environ.get("FLASHQLA_ROOT", "").strip()
         if not root:
-            raise ImportError("FLASHQLA_ROOT is required for the SM75 legacy backend")
+            resolved = _resolve_gdn_flashqla_root()
+            if resolved is None:
+                probe_errors = [
+                    f"{r}: {type(exc).__name__}: {exc}"
+                    for r, exc in _probe_errors.items()
+                ]
+                detail = "; ".join(probe_errors) if probe_errors else "no candidate loaded"
+                raise ImportError(
+                    "FLASHQLA_ROOT is not set and no SM70/SM75 FlashQLA "
+                    "checkout with a built legacy extension was found at the "
+                    "default locations (.deps/FlashQLA-SM70-SM75 under the "
+                    "vLLM runtime root or its parents, ~/.deps/FlashQLA-SM70-SM75, "
+                    "/opt/FlashQLA-SM70-SM75). Probe failures: "
+                    f"{detail}. Export FLASHQLA_ROOT=... and re-run, or build "
+                    "the extension under one of those paths."
+                )
+            root = str(resolved)
         source = (
             Path(root)
             / "flash_qla"
@@ -105,15 +287,17 @@ def _flashqla_legacy_forward():
             / "sm_legacy.py"
         )
         if not source.is_file():
-            raise ImportError(f"FlashQLA SM75 legacy source not found: {source}")
-        spec = importlib.util.spec_from_file_location(
-            "vllm_flashqla_sm75_legacy", source
-        )
+            raise ImportError(
+                f"FLASHQLA_ROOT={root} is set but sm_legacy.py is not found at: {source}"
+            )
+        spec = importlib.util.spec_from_file_location(module_name, source)
         if spec is None or spec.loader is None:
             raise ImportError(f"Unable to load FlashQLA SM75 legacy source: {source}")
         module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
         spec.loader.exec_module(module)
         _flashqla_legacy_module = module
+        logger.debug("FLASHQLA SM75 legacy loaded at request time from root %s", root)
     return _flashqla_legacy_module.chunk_gated_delta_rule_fwd_legacy
 
 
@@ -187,9 +371,16 @@ def _resolve_gdn_prefill_backend(
             # while a graph is being captured.
             _preload_flashqla_legacy_extension()
             supports_flashqla_legacy = True
-        except (ImportError, OSError, RuntimeError, ValueError):
+        except (ImportError, OSError, RuntimeError, ValueError) as exc:
             # FlashQLA is an optional SM75 build dependency.  Keep the stock
-            # Triton route usable when it is not present.
+            # Triton route usable when it is not present, but always leave a
+            # traceable reason so a silent TTFT regression cannot happen.
+            logger.warning_once(
+                "FLASHQLA SM75 legacy preload failed (will fall back to "
+                "Triton/FLA): %s: %s",
+                type(exc).__name__,
+                exc,
+            )
             supports_flashqla_legacy = False
 
     if backend in ["flashinfer", "auto"] and supports_flashinfer:
