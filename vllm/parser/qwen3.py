@@ -120,12 +120,12 @@ def _qwen3_arg_converter(raw_args: str, partial: bool) -> str:
         result = json.dumps(params, ensure_ascii=False)
     except (TypeError, ValueError):
         result = "{}"
-    logger.info(
-        "QWEN3_CONVERTER: partial=%s params=%s result=%s",
-        partial,
-        list(params.keys()),
-        result,
-    )
+    # logger.info(
+    #     "QWEN3_CONVERTER: partial=%s params=%s result=%s",
+    #     partial,
+    #     list(params.keys()),
+    #     result,
+    # )
     return result
 
 
