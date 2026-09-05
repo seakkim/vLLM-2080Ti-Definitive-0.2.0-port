@@ -126,10 +126,10 @@ class LoggingStatLogger(StatLoggerBase):
         self.engine_is_idle = False
         self.aggregated = False
 
-        # Raw per-iteration throughput tracking.
-        self.raw_prompt_tokens: int = 0
-        self.raw_generation_tokens: int = 0
-        self.raw_elapsed_ms: float = 0.0
+        # Live per-second throughput tracking.
+        self._live_last_log_time: float = 0.0
+        self._live_prompt_tokens: int = 0
+        self._live_gen_tokens: int = 0
 
         if self._enable_perf_stats():
             self.perf_metrics_logging = PerfMetricsLogging(vllm_config)
@@ -142,11 +142,6 @@ class LoggingStatLogger(StatLoggerBase):
         self.num_generation_tokens: int = 0
         self.num_corrupted_reqs: int = 0
         self.num_preemptions: int = 0
-
-        # Reset raw per-iteration throughput tracking.
-        self.raw_prompt_tokens = 0
-        self.raw_generation_tokens = 0
-        self.raw_elapsed_ms = 0.0
 
     def _enable_perf_stats(self) -> bool:
         return self.vllm_config.observability_config.enable_mfu_metrics
@@ -217,9 +212,9 @@ class LoggingStatLogger(StatLoggerBase):
         if iteration_stats:
             self._track_iteration_stats(iteration_stats)
 
-            # Capture raw per-iteration throughput data.
-            self.raw_prompt_tokens = iteration_stats.prompt_token_stats.computed
-            self.raw_generation_tokens = iteration_stats.num_generation_tokens
+            # Accumulate tokens for live per-second throughput.
+            self._live_prompt_tokens += iteration_stats.prompt_token_stats.computed
+            self._live_gen_tokens += iteration_stats.num_generation_tokens
 
         if scheduler_stats is not None:
             self._log_iteration_details(scheduler_stats, engine_idx)
@@ -244,11 +239,43 @@ class LoggingStatLogger(StatLoggerBase):
             if (perf_stats := scheduler_stats.perf_stats) and self._enable_perf_stats():
                 self.perf_metrics_logging.observe(perf_stats)
 
-            # Capture raw iteration elapsed time from scheduler details.
-            if (details := scheduler_stats.iteration_details) is not None:
-                self.raw_elapsed_ms = details.elapsed_ms
         if mm_cache_stats:
             self.mm_caching_metrics.observe(mm_cache_stats)
+
+        # Live per-second throughput log (independent of periodic log).
+        now = time.monotonic()
+        if self._live_last_log_time > 0 and (now - self._live_last_log_time) >= 1.0:
+            delta = now - self._live_last_log_time
+            prompt_tp = (
+                self._live_prompt_tokens / delta
+                if self._live_prompt_tokens > 0
+                else 0.0
+            )
+            gen_tp = (
+                self._live_gen_tokens / delta
+                if self._live_gen_tokens > 0
+                else 0.0
+            )
+            if prompt_tp > 0 or gen_tp > 0:
+                logger.info(
+                    "%sLive: %.1f prompt tok/s, "
+                    "%.1f gen tok/s, "
+                    "Running: %d reqs, KV: %.1f%%",
+                    self._log_prefix_for_engine(engine_idx),
+                    prompt_tp,
+                    gen_tp,
+                    scheduler_stats.num_running_reqs
+                    if scheduler_stats is not None
+                    else 0,
+                    scheduler_stats.kv_cache_usage * 100
+                    if scheduler_stats is not None
+                    else 0.0,
+                )
+            self._live_prompt_tokens = 0
+            self._live_gen_tokens = 0
+            self._live_last_log_time = now
+        elif self._live_last_log_time == 0.0:
+            self._live_last_log_time = now
 
     def _update_stats(self):
         now = time.monotonic()
@@ -277,20 +304,6 @@ class LoggingStatLogger(StatLoggerBase):
         # Avoid log noise on an idle production system
         log_fn = logger.debug if self.engine_is_idle else logger.info
 
-        # Compute raw per-iteration throughput.
-        raw_prompt_throughput = 0.0
-        raw_generation_throughput = 0.0
-        if self.raw_elapsed_ms > 0.0:
-            raw_elapsed_s = self.raw_elapsed_ms / 1000.0
-            raw_prompt_throughput = (
-                self.raw_prompt_tokens / raw_elapsed_s
-                if self.raw_prompt_tokens > 0 else 0.0
-            )
-            raw_generation_throughput = (
-                self.raw_generation_tokens / raw_elapsed_s
-                if self.raw_generation_tokens > 0 else 0.0
-            )
-
         # Format and print output.
         log_parts = [
             "Avg prompt throughput: %.1f tokens/s",
@@ -308,14 +321,6 @@ class LoggingStatLogger(StatLoggerBase):
             self.last_scheduler_stats.num_running_reqs,
             total_waiting,
         ]
-
-        # Append raw throughput if non-zero (i.e., during active prefill/decode).
-        if raw_prompt_throughput > 0:
-            log_parts.append("Raw prompt throughput: %.1f tokens/s")
-            log_args.append(raw_prompt_throughput)
-        if raw_generation_throughput > 0:
-            log_parts.append("Raw generation throughput: %.1f tokens/s")
-            log_args.append(raw_generation_throughput)
 
         if self.last_scheduler_stats.num_skipped_waiting_reqs > 0:
             log_parts.append("Deferred: %d reqs")
